@@ -34,6 +34,7 @@ export default function PipelineBuilder({ initial, onSave, onCancel }: Props) {
       label: `Stage ${stages.length + 1}`,
       prompt: '',
       gate: 'auto',
+      dependsOn: [],
     }
     setStages((prev) => [...prev, newStage])
     setExpandedStage(id)
@@ -282,6 +283,51 @@ export default function PipelineBuilder({ initial, onSave, onCancel }: Props) {
                           ))}
                         </div>
                       </div>
+
+                      {/* Depends On (DAG dependencies) */}
+                      {index > 0 && (
+                        <div>
+                          <label style={{ fontSize: 11, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 4, display: 'block' }}>
+                            Depends On
+                          </label>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                            {stages.slice(0, index).map((other) => {
+                              const checked = stage.dependsOn?.includes(other.id) ?? false
+                              return (
+                                <label
+                                  key={other.id}
+                                  style={{
+                                    display: 'flex', alignItems: 'center', gap: 4,
+                                    padding: '4px 8px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+                                    border: `1px solid ${checked ? 'var(--accent)' : 'var(--border-subtle)'}`,
+                                    background: checked ? 'var(--accent-muted)' : 'transparent',
+                                    color: checked ? 'var(--accent)' : 'var(--text-secondary)',
+                                  }}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(e) => {
+                                      const deps = stage.dependsOn ?? []
+                                      const next = e.target.checked
+                                        ? [...deps, other.id]
+                                        : deps.filter((d) => d !== other.id)
+                                      updateStage(stage.id, { dependsOn: next })
+                                    }}
+                                    style={{ display: 'none' }}
+                                  />
+                                  {other.label || other.id}
+                                </label>
+                              )
+                            })}
+                          </div>
+                          {(!stage.dependsOn || stage.dependsOn.length === 0) && (
+                            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                              No dependencies — runs in parallel with other independent stages
+                            </div>
+                          )}
+                        </div>
+                      )}
 
                       {/* Prompt template */}
                       <div>

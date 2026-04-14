@@ -17,6 +17,7 @@ class PipelineStage(BaseModel):
     label: str
     prompt: str = ""
     gate: str = "auto"  # auto | approval | manual_input
+    dependsOn: list[str] = []  # stage IDs that must complete before this stage runs
 
 
 class PipelineCreate(BaseModel):

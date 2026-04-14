@@ -157,124 +157,153 @@ UpdateCallback = Callable[[PipelineRun, str], Awaitable[None]]
 
 # ── Engine ────────────────────────────────────────────────────────────────
 
+def _build_stage_index(pipeline: PipelineResponse) -> dict[str, int]:
+    """Map stage id → index in pipeline.stages."""
+    return {s.id: i for i, s in enumerate(pipeline.stages)}
+
+
+def _ready_stages(
+    pipeline: PipelineResponse,
+    run: PipelineRun,
+    stage_idx: dict[str, int],
+) -> list[str]:
+    """Return stage IDs whose dependencies are all completed and that are still pending."""
+    ready = []
+    for stage_def in pipeline.stages:
+        exec_ = run.stages[stage_idx[stage_def.id]]
+        if exec_.status != "pending":
+            continue
+        deps_met = all(
+            run.stages[stage_idx[dep]].status == "completed"
+            for dep in stage_def.dependsOn
+        )
+        if deps_met:
+            ready.append(stage_def.id)
+    return ready
+
+
+async def _execute_single_stage(
+    stage_def,
+    stage_exec: StageExecution,
+    run: PipelineRun,
+    on_update: "UpdateCallback | None",
+) -> str:
+    """Execute one stage via kiro-cli. Returns 'completed', 'failed', 'waiting_approval', or 'waiting_input'."""
+    stage_exec.status = "running"
+    stage_exec.startedAt = datetime.now(timezone.utc).isoformat()
+    save_run(run)
+    if on_update:
+        await on_update(run, "stage_start")
+
+    prompt = resolve_template(stage_def.prompt, run)
+
+    try:
+        handle = session_manager.spawn_session(agent=stage_def.agentSlug)
+        async for _ in session_manager.read_output(handle.id, idle_timeout=2.0):
+            pass
+        session_manager.send_input(handle.id, prompt + "\n")
+
+        full_output = ""
+        async for chunk in session_manager.read_output(handle.id, idle_timeout=10.0):
+            full_output += chunk
+            stage_exec.output = full_output
+            save_run(run)
+            if on_update:
+                await on_update(run, "stage_output")
+
+        stage_exec.output = full_output
+        session_manager.terminate_session(handle.id)
+    except Exception as e:
+        stage_exec.status = "failed"
+        stage_exec.error = str(e)
+        stage_exec.completedAt = datetime.now(timezone.utc).isoformat()
+        save_run(run)
+        if on_update:
+            await on_update(run, "stage_failed")
+        return "failed"
+
+    # Evaluate gate
+    if stage_def.gate == "approval":
+        stage_exec.status = "waiting_approval"
+        save_run(run)
+        if on_update:
+            await on_update(run, "waiting_approval")
+        return "waiting_approval"
+
+    if stage_def.gate == "manual_input":
+        stage_exec.status = "waiting_input"
+        save_run(run)
+        if on_update:
+            await on_update(run, "waiting_input")
+        return "waiting_input"
+
+    # auto gate → completed
+    stage_exec.status = "completed"
+    stage_exec.completedAt = datetime.now(timezone.utc).isoformat()
+    save_run(run)
+    if on_update:
+        await on_update(run, "stage_complete")
+    return "completed"
+
+
 async def execute_run(
     run: PipelineRun,
     pipeline: PipelineResponse,
     on_update: UpdateCallback | None = None,
 ) -> PipelineRun:
-    """Execute a pipeline run stage by stage.
+    """Execute a pipeline run as a DAG.
 
-    This is the main engine loop. It runs stages sequentially, resolving
-    templates, spawning kiro-cli sessions, and evaluating gates.
-
-    If a stage has gate='approval', execution pauses and returns.
-    Call resume_run() after approval to continue.
+    Stages with no dependsOn start in parallel. Stages with dependsOn
+    wait until all dependencies complete. If any stage hits a gate
+    (approval/manual_input) or fails, execution pauses.
+    Call resume after resolving the gate to continue.
     """
+    import asyncio
+
     run.status = "running"
     save_run(run)
 
-    for i, stage_def in enumerate(pipeline.stages):
-        stage_exec = run.stages[i]
+    stage_idx = _build_stage_index(pipeline)
 
-        # Skip already completed stages (for resume after approval)
-        if stage_exec.status == "completed":
-            continue
-
-        # Skip if we hit a waiting stage that hasn't been resolved yet
-        if stage_exec.status == "waiting_approval":
-            run.status = "waiting_approval"
+    while True:
+        # Check for blocking states first
+        has_waiting = any(
+            s.status in ("waiting_approval", "waiting_input") for s in run.stages
+        )
+        if has_waiting:
+            waiting = next(s for s in run.stages if s.status in ("waiting_approval", "waiting_input"))
+            run.status = waiting.status
             save_run(run)
-            if on_update:
-                await on_update(run, "waiting_approval")
             return run
 
-        if stage_exec.status == "waiting_input":
-            run.status = "waiting_input"
-            save_run(run)
-            if on_update:
-                await on_update(run, "waiting_input")
-            return run
-
-        # Mark stage as running
-        stage_exec.status = "running"
-        stage_exec.startedAt = datetime.now(timezone.utc).isoformat()
-        save_run(run)
-        if on_update:
-            await on_update(run, "stage_start")
-
-        # Resolve prompt template
-        prompt = resolve_template(stage_def.prompt, run)
-
-        # Execute via kiro-cli
-        try:
-            handle = session_manager.spawn_session(
-                agent=stage_def.agentSlug,
-            )
-
-            # Drain startup output
-            async for _ in session_manager.read_output(handle.id, idle_timeout=2.0):
-                pass
-
-            # Send the prompt
-            session_manager.send_input(handle.id, prompt + "\n")
-
-            # Collect output
-            full_output = ""
-            async for chunk in session_manager.read_output(handle.id, idle_timeout=10.0):
-                full_output += chunk
-                stage_exec.output = full_output
-                save_run(run)
-                if on_update:
-                    await on_update(run, "stage_output")
-
-            # Stage completed
-            stage_exec.status = "completed"
-            stage_exec.output = full_output
-            stage_exec.completedAt = datetime.now(timezone.utc).isoformat()
-            save_run(run)
-
-            # Terminate this stage's session
-            session_manager.terminate_session(handle.id)
-
-            if on_update:
-                await on_update(run, "stage_complete")
-
-        except Exception as e:
-            stage_exec.status = "failed"
-            stage_exec.error = str(e)
-            stage_exec.completedAt = datetime.now(timezone.utc).isoformat()
+        has_failed = any(s.status == "failed" for s in run.stages)
+        if has_failed:
             run.status = "failed"
             save_run(run)
-            if on_update:
-                await on_update(run, "stage_failed")
             return run
 
-        # Evaluate gate
-        if stage_def.gate == "approval":
-            stage_exec.status = "waiting_approval"
-            run.status = "waiting_approval"
-            save_run(run)
-            if on_update:
-                await on_update(run, "waiting_approval")
+        ready = _ready_stages(pipeline, run, stage_idx)
+        if not ready:
+            # No more stages to run — check if all completed
+            all_done = all(s.status == "completed" for s in run.stages)
+            if all_done:
+                run.status = "completed"
+                run.completedAt = datetime.now(timezone.utc).isoformat()
+                save_run(run)
+                if on_update:
+                    await on_update(run, "run_complete")
             return run
 
-        if stage_def.gate == "manual_input":
-            stage_exec.status = "waiting_input"
-            run.status = "waiting_input"
-            save_run(run)
-            if on_update:
-                await on_update(run, "waiting_input")
-            return run
+        # Execute all ready stages in parallel
+        tasks = []
+        for stage_id in ready:
+            idx = stage_idx[stage_id]
+            stage_def = pipeline.stages[idx]
+            stage_exec = run.stages[idx]
+            tasks.append(_execute_single_stage(stage_def, stage_exec, run, on_update))
 
-        # gate == "auto" → continue to next stage
-
-    # All stages completed
-    run.status = "completed"
-    run.completedAt = datetime.now(timezone.utc).isoformat()
-    save_run(run)
-    if on_update:
-        await on_update(run, "run_complete")
-    return run
+        await asyncio.gather(*tasks)
+        # Loop back to find next wave of ready stages
 
 
 async def approve_stage(run_id: str, stage_id: str) -> PipelineRun | None:

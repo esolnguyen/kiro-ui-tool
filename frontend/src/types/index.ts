@@ -60,6 +60,7 @@ export interface PipelineStage {
   label: string
   prompt: string
   gate: 'auto' | 'approval' | 'manual_input'
+  dependsOn: string[]  // stage IDs that must complete before this stage runs
 }
 
 export interface Pipeline {

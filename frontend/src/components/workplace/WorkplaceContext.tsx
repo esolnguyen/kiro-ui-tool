@@ -49,6 +49,7 @@ interface WorkplaceContextValue {
 
   // Pipeline run
   activePipelineRun: PipelineRun | null
+  activePipelineDef: Pipeline | null
   startPipelineRun: (pipelineId: string, input?: Record<string, unknown>) => Promise<void>
   dismissPipelineRun: () => void
   approvePipelineStage: (stageId: string) => Promise<void>
@@ -85,7 +86,6 @@ export function WorkplaceProvider({ children }: { children: ReactNode }) {
   const [activePipelineRun, setActivePipelineRun] = useState<PipelineRun | null>(null)
   const [activePipelineDef, setActivePipelineDef] = useState<Pipeline | null>(null)
   const pipelineWsRef = useRef<WebSocket | null>(null)
-  const lastDispatchedStageRef = useRef<string | null>(null)
 
   const setSendFn = useCallback((fn: (prompt: string, agentOverride?: string) => void) => {
     setSendFnRef({ fn })
@@ -204,44 +204,52 @@ export function WorkplaceProvider({ children }: { children: ReactNode }) {
     return lines.join('\n')
   }, [])
 
-  // Dispatch a stage's prompt to the terminal
+  // Dispatch a stage's prompt to the terminal via /spawn
   const dispatchStageToTerminal = useCallback((stageId: string, pipelineDef: Pipeline, run: PipelineRun) => {
     const stageDef = pipelineDef.stages.find((s) => s.id === stageId)
     if (!stageDef) return
-    lastDispatchedStageRef.current = stageId
 
     const context = buildTemplateContext(run, pipelineDef)
     let prompt = resolvePrompt(stageDef.prompt, context)
 
-    // Append handoff context for non-first stages
+    // Append handoff context for stages with dependencies
     const stageIndex = pipelineDef.stages.findIndex((s) => s.id === stageId)
     prompt += buildHandoffContext(stageIndex, pipelineDef, run)
 
-    sendPromptToTerminal(prompt, stageDef.agentSlug)
+    // Use /spawn to run each stage as a parallel session
+    const spawnCmd = `/spawn --name ${stageId} ${prompt}`
+    sendPromptToTerminal(spawnCmd)
   }, [resolvePrompt, buildTemplateContext, buildHandoffContext, sendPromptToTerminal])
+
+  // Track which stages have already been dispatched to avoid re-sending
+  const dispatchedStagesRef = useRef<Set<string>>(new Set())
 
   const startPipelineRun = useCallback(async (pipelineId: string, input: Record<string, unknown> = {}) => {
     const run = await pipelineRunsApi.start(pipelineId, input)
     const pipelineDef = pipelines.find((p) => p.id === pipelineId) ?? null
-    lastDispatchedStageRef.current = null
+    dispatchedStagesRef.current = new Set()
     setActivePipelineRun(run)
     setActivePipelineDef(pipelineDef)
 
-    // Kick off the first running stage in the terminal
+    // Dispatch all running stages (DAG may start multiple in parallel)
     if (pipelineDef) {
-      const runningStage = run.stages.find((s) => s.status === 'running')
-      if (runningStage) {
-        dispatchStageToTerminal(runningStage.id, pipelineDef, run)
+      for (const stage of run.stages) {
+        if (stage.status === 'running' && !dispatchedStagesRef.current.has(stage.id)) {
+          dispatchStageToTerminal(stage.id, pipelineDef, run)
+          dispatchedStagesRef.current.add(stage.id)
+        }
       }
     }
   }, [pipelines, dispatchStageToTerminal])
 
-  // When the backend advances to a new running stage, dispatch it to the terminal
+  // When the backend advances to new running stages, dispatch them via /spawn
   useEffect(() => {
     if (!activePipelineRun || !activePipelineDef) return
-    const runningStage = activePipelineRun.stages.find((s) => s.status === 'running')
-    if (runningStage && runningStage.id !== lastDispatchedStageRef.current) {
-      dispatchStageToTerminal(runningStage.id, activePipelineDef, activePipelineRun)
+    for (const stage of activePipelineRun.stages) {
+      if (stage.status === 'running' && !dispatchedStagesRef.current.has(stage.id)) {
+        dispatchStageToTerminal(stage.id, activePipelineDef, activePipelineRun)
+        dispatchedStagesRef.current.add(stage.id)
+      }
     }
   }, [activePipelineRun, activePipelineDef, dispatchStageToTerminal])
 
@@ -249,7 +257,7 @@ export function WorkplaceProvider({ children }: { children: ReactNode }) {
     pipelineWsRef.current?.close()
     setActivePipelineRun(null)
     setActivePipelineDef(null)
-    lastDispatchedStageRef.current = null
+    dispatchedStagesRef.current = new Set()
   }, [])
 
   const approvePipelineStage = useCallback(async (stageId: string) => {
@@ -290,7 +298,7 @@ export function WorkplaceProvider({ children }: { children: ReactNode }) {
       termReady, setTermReady,
       sendPromptToTerminal, setSendFn,
       isWhipping,
-      activePipelineRun, startPipelineRun, dismissPipelineRun,
+      activePipelineRun, activePipelineDef, startPipelineRun, dismissPipelineRun,
       approvePipelineStage, rejectPipelineStage, submitPipelineInput, retryPipelineStage,
     }}>
       {children}
